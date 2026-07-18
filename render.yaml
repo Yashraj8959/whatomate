@@ -1,0 +1,128 @@
+# Whatomate — Render Blueprint (Infrastructure as Code)
+# ---------------------------------------------------------------------------
+# This provisions EVERYTHING Whatomate needs on Render in one click:
+#   1. PostgreSQL  (managed database)
+#   2. Key Value   (Redis — required; powers job queue, live chat, rate limits)
+#   3. Web service (the app, built from this repo's docker/Dockerfile)
+#
+# HOW TO USE:
+#   1. Fork https://github.com/shridarpatil/whatomate to YOUR GitHub account
+#      and push this file to it.
+#   2. Render Dashboard -> New -> Blueprint -> connect your fork.
+#   3. Render reads this file and creates all 3 services, wiring DB + Redis
+#      credentials into the app automatically. Click "Apply".
+#
+# NOTE ON PLANS: everything below is on the FREE plan so you pay nothing to
+# start. Free caveats to know:
+#   - Free web service SPINS DOWN after ~15 min idle (first request after that
+#     is a slow cold start, and background campaign/worker jobs pause while
+#     asleep). For a live WhatsApp number, upgrade the web service to "starter".
+#   - Free PostgreSQL is DELETED after 30 days. For anything real, upgrade it.
+# To upgrade, just change `plan: free` -> `plan: starter` (web) / a paid
+# Postgres plan, in the dashboard or here.
+#
+# REGION: set to Singapore (closest low-latency region to India). Change
+# `region:` on all three to keep them co-located if you prefer elsewhere.
+# ---------------------------------------------------------------------------
+
+databases:
+  - name: whatomate-db
+    plan: free
+    region: singapore
+    databaseName: whatomate
+    user: whatomate
+
+services:
+  # --- Redis (Render Key Value). Internal-only, no public access. ---
+  - type: keyvalue
+    name: whatomate-redis
+    plan: free
+    region: singapore
+    ipAllowList: []            # empty = only reachable from your Render services
+    maxmemoryPolicy: noeviction
+
+  # --- The Whatomate app ---
+  - type: web
+    name: whatomate
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./docker/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true            # redeploy on every push to your fork's default branch
+    envVars:
+      # ----- App -----
+      # Starts in "staging": boots cleanly WITHOUT needing to know your final
+      # URL. Once you have your real URL (see post-deploy steps in chat), flip
+      # this to "production" and fill ALLOWED_ORIGINS below for full hardening.
+      - key: WHATOMATE_APP__ENVIRONMENT
+        value: staging
+      - key: TZ
+        value: UTC
+      # AES key for encrypting WhatsApp tokens at rest. Any random string works
+      # (it's hashed to 32 bytes internally). Render generates one for you.
+      - key: WHATOMATE_APP__ENCRYPTION_KEY
+        generateValue: true
+
+      # ----- Auth secrets (Render generates strong random values) -----
+      # If the app ever logs "JWT secret must be at least 32 characters",
+      # replace this in the dashboard with the output of: openssl rand -hex 32
+      - key: WHATOMATE_JWT__SECRET
+        generateValue: true
+
+      # ----- CORS (only enforced when ENVIRONMENT=production) -----
+      # After first deploy, set this to your real URL, e.g.
+      #   https://whatomate.onrender.com
+      # (comma-separated if you add a custom domain later). Leave blank for now.
+      - key: WHATOMATE_SERVER__ALLOWED_ORIGINS
+        sync: false
+
+      # ----- PostgreSQL (auto-wired from whatomate-db above) -----
+      - key: WHATOMATE_DATABASE__HOST
+        fromDatabase:
+          name: whatomate-db
+          property: host
+      - key: WHATOMATE_DATABASE__PORT
+        fromDatabase:
+          name: whatomate-db
+          property: port
+      - key: WHATOMATE_DATABASE__USER
+        fromDatabase:
+          name: whatomate-db
+          property: user
+      - key: WHATOMATE_DATABASE__PASSWORD
+        fromDatabase:
+          name: whatomate-db
+          property: password
+      - key: WHATOMATE_DATABASE__NAME
+        fromDatabase:
+          name: whatomate-db
+          property: database
+      - key: WHATOMATE_DATABASE__SSL_MODE
+        value: require          # Render Postgres requires an encrypted connection
+
+      # ----- Redis (auto-wired from whatomate-redis above) -----
+      # Internal Render Key Value connections use host+port with no password/TLS.
+      - key: WHATOMATE_REDIS__HOST
+        fromService:
+          type: keyvalue
+          name: whatomate-redis
+          property: host
+      - key: WHATOMATE_REDIS__PORT
+        fromService:
+          type: keyvalue
+          name: whatomate-redis
+          property: port
+
+      # ----- WhatsApp webhook verify token -----
+      # You'll paste this SAME value into Meta's webhook config later.
+      - key: WHATOMATE_WHATSAPP__WEBHOOK_VERIFY_TOKEN
+        generateValue: true
+
+      # ----- First-run admin login (only used when no users exist yet) -----
+      # CHANGE the password after your first login.
+      - key: WHATOMATE_DEFAULT_ADMIN__EMAIL
+        value: admin@admin.com
+      - key: WHATOMATE_DEFAULT_ADMIN__PASSWORD
+        sync: false             # set your own strong password at deploy time
